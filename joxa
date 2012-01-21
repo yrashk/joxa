@@ -1,3 +1,0 @@
-#! /bin/sh
-
-erl -noshell -env ERL_LIBS deps -pa ebin -s joxa.shell start 

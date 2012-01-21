@@ -5,6 +5,7 @@
 
 
 
+
 (defn prompt (ctx)
   (lists/concat [
                  (atom_to_list (joxa.compiler/get-context :module-name ctx))
@@ -19,9 +20,9 @@
   (case type
         (:require :requires)
         (:use :uses)))
-        
+
 (defn transform-module-expr (type expr ctx)
-  [:module 
+  [:module
    (joxa.compiler/get-context :module-name ctx)
    (type .
          (lists/concat [(ec_dictionary/to_list (joxa.compiler/get-context (transform-module-expr-attr type) ctx))
@@ -60,13 +61,13 @@
 (defn eval (parse ctx)
   (case parse
         ({annots ast (= rest {:parse-output _ path _ _})}
-         
+
          (let ((ast1 (transform-expr ast ctx))
                (ctx1 (joxa.compiler/comp-forms (joxa.compiler/traverse-path path)
-                                               (prepare-context 
+                                               (prepare-context
                                                 (joxa.compiler/set-context :annots annots ctx))
                                                ast1)))
-           (case (joxa.compiler/compile-context ctx1)
+           (case (joxa.compiler/compile-context ctx1 :intermediate)
                  ({ctx2 binary}
                   (let ((_
                          (code/load_binary (joxa.compiler/get-context :module-name ctx2) "shell" binary))
@@ -87,7 +88,7 @@
           (e (eval r ctx)))
       (case e
             ({result ctx1}
-               (do 
+               (do
                  (print result ctx1)
                  (loop ctx1)))))))
 

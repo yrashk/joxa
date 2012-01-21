@@ -1,3 +1,0 @@
-#! /bin/sh
-
-erl -noshell -env ERL_LIBS deps -pa ebin -pa _builds/joxa/lib/*/ebin -s 'joxa.compiler' main -s erlang halt  -extra $*
