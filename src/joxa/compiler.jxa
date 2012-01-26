@@ -17,6 +17,7 @@
                  compile io io_lib
                  crypto binary)
         (use (erlang :only (+/2
+                            </2
                             ==/2
                             and/2
                             or/2
@@ -87,7 +88,7 @@
         (<<>>
          {:fail {:expected :any-character index}})
         (<<(c :utf8) (rest :binary)>>
-         {c rest (p-advance-index c index)}))))
+           {c rest (p-advance-index c index)}))))
 
 
 (defn+ p-string (s)
@@ -99,7 +100,7 @@
          (fn (input index)
              (case input
                (<<(s :size length :binary) (rest :binary)>>
-                {s rest (p-advance-index s index)})
+                  {s rest (p-advance-index s index)})
                (_
                 {:fail {:expected {:string s} index}})))))))
 
@@ -1057,16 +1058,16 @@
 (defn+ remote-function-ctx? (module function possible-arity ctx aliased)
   (__try
    (let (requires (get-context :requires ctx)
-         exports (ec_dictionary/get module requires))
+                  exports (ec_dictionary/get module requires))
      (case (lists/member {function possible-arity} exports)
        (:true
-          (case (get-joxa-info module :rest function)
-             (:false
-               {:remote module function possible-arity})
-             (arity (when (erlang/is_integer arity))
-               {:remote-rest module function arity})))
+        (case (get-joxa-info module :rest function)
+          (:false
+           {:remote module function possible-arity})
+          (arity (when (erlang/is_integer arity))
+                 {:remote-rest module function arity})))
        (:false
-         (rest-reference-ctx? module function possible-arity exports))))
+        (rest-reference-ctx? module function possible-arity exports))))
    (catch (_type body)
      (case body
        (:not_found
@@ -1123,12 +1124,12 @@
                             :false)))
                      defs)
       (:true
-        (case (rest-defined-function-ctx? (get-context :module-name ctx)
-                                          name)
-          (:not-a-reference
-           {:apply name possible-arity})
-          (rest-apply
-           rest-apply)))
+       (case (rest-defined-function-ctx? (get-context :module-name ctx)
+                                         name)
+         (:not-a-reference
+          {:apply name possible-arity})
+         (rest-apply
+          rest-apply)))
       (:false
        (case (rest-defined-function-ctx? (get-context :module-name ctx)
                                          name)
@@ -1146,16 +1147,20 @@
     ((_ . scopes)
      (set-context :scopes scopes ctx))))
 
-(defn+ add-reference-to-scope-ctx (name arity ctx)
-  (let (scopes (get-context :scopes ctx)
-               body     (case arity
-                          (-1 (cerl/c_var name))
-                          (Arity (cerl/c_fname name arity))))
+(defn add-to-annots (cerl-thing annots)
+  (let (old-annots (cerl/get_ann cerl-thing))
+    (cerl/set_ann cerl-thing (lists/append old-annots annots))))
+
+(defn+ add-reference-to-scope-ctx (annots name cerl-var ctx)
+  (let (scopes (get-context :scopes ctx))
     (case scopes
       ((current . rest)
-       (set-context :scopes ((ec_dictionary/add {name arity} body current) . rest) ctx))
+       (set-context :scopes ((ec_dictionary/add name cerl-var current) . rest) ctx))
       ([]
        (erlang/throw :no-scope)))))
+
+(defn+ add-reference-to-scope-ctx (name cerl-var ctx)
+  (add-reference-to-scope-ctx [] name cerl-var ctx))
 
 (defn+ resolve-reference-ctx (ref arity ctx)
   (case ref
@@ -1174,18 +1179,22 @@
      (erlang/throw {:mismatched-arity module function arity invalid-arity}))
     (name
      (when (erlang/is_atom name))
-     (let (scopes (get-context :scopes ctx))
-       (case (ec_lists/search (fn (scope)
-                                  (__try
-                                   {:ok (ec_dictionary/get {name arity} scope)}
-                                   (catch (_type body)
-                                     (case body
+     (case (defined-used-function-ctx? name arity ctx)
+       (:not-a-reference
+        (let (scopes (get-context :scopes ctx))
+          (case (ec_lists/search (fn (scope)
+                                    (__try
+                                     {:ok (ec_dictionary/get name scope)}
+                                     (catch (_type body)
+                                       (case body
                                        (:not_found
                                         :not_found))))) scopes)
-         ({:ok var _}
-          {:reference var arity})
-         (:not_found
-          (defined-used-function-ctx? name arity ctx)))))
+           ({:ok var _}
+            {:reference var})
+           (:not_found
+            :not-a-reference))))
+       (result
+        result)))
     (_
      :not-a-reference)))
 
@@ -1627,9 +1636,20 @@
     ((arg . rest)
      (case (erlang/< count arity)
        (:true
-         (args-to-arity rest (erlang/+ count 1) arity (arg . acc)))
-        (:false
-         (args-to-arity [] 0 arity ((args-to-list args0) . acc)))))))
+        (args-to-arity rest (erlang/+ count 1) arity (arg . acc)))
+       (:false
+        (args-to-arity [] 0 arity ((args-to-list args0) . acc)))))))
+
+(defn+ runtime-args-to-arity (args0 count arity acc)
+  (case args0
+    ([]
+     (lists/reverse acc))
+    ((arg . rest)
+     (case (erlang/< count arity)
+       (:true
+        (runtime-args-to-arity rest (erlang/+ count 1) arity (arg . acc)))
+       (:false
+        (runtime-args-to-arity [] 0 arity (rest . acc)))))))
 
 (defn eval-args (path0 ctx0 args0)
   (case (lists/foldl (fn (arg acc0)
@@ -1642,83 +1662,249 @@
     ({_ ctx3 args1}
      {ctx3 (lists/reverse args1)})))
 
+(defn is-rest-var? (var)
+  (let (annots (cerl/get_ann var))
+    (case (lists/keysearch :rest 1 annots)
+      ({value val}
+       val)
+      (_
+      (case (lists/keysearch :not-rest 1 annots)
+        ({value val}
+         val)
+        (_
+         :unknown))))))
+
+(defn+ gensym ()
+  (let (x (erlang/phash2 {(erlang/node) (erlang/now ) (crypto/rand_bytes 16)})
+          bit-rep (lists/map (fn (el)
+                                 (io_lib/format "~.16B" [el]))
+                             (erlang/binary_to_list
+                              (binary/encode_unsigned x))))
+    (erlang/list_to_atom
+     (lists/flatten
+      (io_lib/format "GENSYM_~s" [bit-rep])))))
+
+(definline make-rest-runtime-call (annots var-to-call arg-list actual-call)
+  (let (ival (cerl/c_var (gensym))
+        type-var (cerl/c_var (gensym))
+        value-var (cerl/c_var (gensym))
+        ignore-var (cerl/c_var (gensym)))
+  (cerl/ann_c_try annots
+                  (cerl/ann_c_case
+                   annots
+                   (cerl/ann_c_call annots
+                                    (cerl/ann_c_var annots :module)
+                                    (cerl/ann_c_atom annots :--joxa-info)
+                                    [(cerl/ann_c_atom annots :rest)
+                                     (cerl/ann_c_tuple
+                                      annots
+                                      [(cerl/ann_c_atom annots :anon)
+                                       (cerl/ann_c_var annots :index)])])
+                   [(cerl/ann_c_clause
+                     annots
+                     [(cerl/ann_c_var annots :arity)]
+                     (cerl/ann_c_call annots
+                                      (cerl/ann_c_atom annots :erlang)
+                                      (cerl/ann_c_atom annots :is_integer)
+                                      [(cerl/ann_c_var annots :arity)])
+                     (cerl/ann_c_call
+                      annots
+                      (cerl/ann_c_atom annots :erlang)
+                      (cerl/ann_c_atom annots :apply)
+                      [var-to-call
+                       (cerl/ann_c_call annots
+                                        (cerl/ann_c_atom annots :joxa.compiler)
+                                        (cerl/ann_c_atom annots :runtime-args-to-arity)
+                                        [(args-to-list arg-list) (cerl/ann_c_int annots 1)
+                                         (cerl/ann_c_var annots :arity)
+                                         (cerl/ann_c_nil annots)])]))
+                    (cerl/ann_c_clause
+                     annots
+                     [(cerl/ann_c_var annots (gensym))]
+                     (cerl/ann_c_atom annots :true)
+                     actual-call)])
+                  [ival],
+                  ival,
+                  [type-var value-var ignore-var],
+                  (cerl/ann_c_case annots
+                                   (cerl/ann_c_values annots [type-var value-var])
+                                   [(cerl/ann_c_clause annots
+                                                      [(cerl/ann_c_atom annots :error)
+                                                       (cerl/ann_c_atom annots :undef)]
+                                                      (cerl/ann_c_atom annots :true)
+                                                      actual-call)
+                                    (cerl/ann_c_clause annots
+                                                       [type-var value-var]
+                                                       (cerl/ann_c_atom annots :true)
+                                                       (cerl/ann_c_primop annots
+                                                                          (cerl/ann_c_atom annots :raise)
+                                                                          [value-var ignore-var]))]))))
+
+
+(defn make-rest-runtime-translate-fun (ctx0 var-to-call arity)
+  (let (annots [:compiler_generated]
+        arg-list (lists/map (fn (_)
+                                (cerl/ann_c_var [:compiler_generated]
+                                                (gensym)))
+                            (lists/seq 1 arity))
+         actual-call (cerl/ann_c_apply annots
+                                       var-to-call
+                                       arg-list))
+    {(incr-fun-index-ctx ctx0)
+     (cerl/ann_c_fun
+      annots arg-list
+      (cerl/ann_c_case
+       annots
+       (cerl/ann_c_call
+        annots
+        (cerl/ann_c_atom annots :erlang)
+        (cerl/ann_c_atom annots :fun_info)
+        [var-to-call (cerl/ann_c_atom annots :module)])
+       [(cerl/ann_c_clause
+         annots
+         [(cerl/ann_c_tuple
+           annots
+           [(cerl/ann_c_atom annots :module)
+            (cerl/ann_c_var annots :module)])]
+         (cerl/ann_c_atom annots :true)
+         (cerl/ann_c_case
+          annots
+          (cerl/ann_c_call annots
+                           (cerl/ann_c_atom annots :erlang)
+                           (cerl/ann_c_atom annots :fun_info)
+                           [var-to-call (cerl/ann_c_atom annots :index)])
+          [(cerl/ann_c_clause
+            annots
+            [(cerl/ann_c_tuple
+              annots
+              [(cerl/ann_c_atom annots :index)
+               (cerl/ann_c_var annots :index)])]
+            (cerl/ann_c_atom annots :true)
+
+            (make-rest-runtime-call annots var-to-call arg-list actual-call))
+
+           (cerl/ann_c_clause
+            annots
+            [(cerl/ann_c_var annots (gensym))]
+            (cerl/ann_c_atom annots :true)
+            actual-call)]))
+        (cerl/ann_c_clause
+         annots
+         [(cerl/ann_c_var annots (gensym))]
+         (cerl/ann_c_atom annots :true)
+         actual-call)]))}))
+
+
+
 (defn make-apply (path0 ctx0 form)
-  (let (annots (annots-from-context [] path0 ctx0)
-               build-apply (fn (path1 ctx1 cerl-target args)
-                               (case (eval-args (incr-path 2 path1) ctx1 args)
-                                 ({ctx2 cerl-arg-list}
-                                  (case (cerl/is_c_fname cerl-target)
-                                    (:true
-                                     (case (==  (cerl/fname_arity cerl-target)
-                                                (erlang/length cerl-arg-list))
-                                       (:true
-                                        {ctx2 (cerl/ann_c_apply annots cerl-target cerl-arg-list)})
-                                       (:false
-                                        (erlang/throw {:invalid-arity (idx-from-context [] path0 ctx0)}))))
-                                    (:false
-                                     {ctx2 (cerl/ann_c_apply annots cerl-target cerl-arg-list)}))))))
+  (let (annots (annots-from-context [] path0 ctx0))
     (case form
-      ((:apply . ((= ref  {:--fun module function _}) . args))
-       (case (resolve-reference-ctx function (erlang/length args) ctx0)
-         ({:remote module function arity}
-          (case (eval-args (incr-path 2 path0) ctx0 args)
-            ({ctx1 arg-list}
+      ((:apply . (target . args))
+       (case (eval-args (incr-path 2 path0) ctx0 args)
+         ({ctx1 arg-list}
+          (case (resolve-reference-ctx target (erlang/length args) ctx0)
+            ({:reference var}
+             (case (is-rest-var? var)
+               ({:rest arity}
+                {ctx1 (cerl/ann_c_apply annots
+                                        var
+                                        (args-to-arity arg-list 1 arity []))})
+               ({:not-rest arity}
+                {ctx1 (cerl/ann_c_apply annots
+                                        var
+                                        arg-list)})
+               (:unknown
+                (case (make-rest-runtime-translate-fun ctx1 var (erlang/length arg-list))
+                  ({ctx2 t-var}
+                   {ctx2 (cerl/ann_c_apply annots
+                                           t-var
+                                           arg-list)})))))
+            ({:remote module function arity}
              {ctx1 (cerl/ann_c_call annots
                                     (cerl/ann_c_atom annots module)
                                     (cerl/ann_c_atom annots function)
-                                    arg-list)})))
-         (_
-          (erlang/throw {:invalid-reference  ref (erlang/length args)
-                                             (idx-from-context [] path0 ctx0)}))))
-      ((:apply . ((= ref {--fun function arity}) . args))
-       (case (resolve-reference-ctx function (erlang/length args) ctx0)
-         ({:apply function arity}
-          (build-apply path0 ctx0 (cerl/ann_c_fname annots function arity) args))
-         (_
-          (erlang/throw {:invalid-reference ref (erlang/length args)
-                                            (idx-from-context [] path0 ctx0)}))))
-      ((:apply . (target . args))
-       (when (erlang/is_atom target))
-       (case (resolve-reference-ctx target (erlang/length args) ctx0)
-         ({:reference val _}
-          (build-apply path0 ctx0 (cerl/set_ann val annots) args))
-         (:not-a-reference
-          (case (comp-expr (traverse-path path0) ctx0 target)
-            ({ctx1 cerl-val}
-             (build-apply path0 ctx0 cerl-val args))
-            (_
-             (erlang/throw {:invalid-reference target (erlang/length args)
-                                               (idx-from-context [] path0 ctx0)}))))))
-      ((:apply . (target . args))
-       (case (comp-expr (traverse-incr-path path0) ctx0 target)
-         ({ctx1 cerl-target}
-          (build-apply path0 ctx0 cerl-target args))
-         (_
-          (erlang/throw {:invalid-reference target (erlang/length args)
-                                            (idx-from-context [] path0 ctx0)})))))))
+                                    arg-list)})
+            ({:remote-rest module function arity}
+             {ctx1 (cerl/ann_c_call annots
+                                    (cerl/ann_c_atom annots module)
+                                    (cerl/ann_c_atom annots function)
+                                    (args-to-arity arg-list 1 arity []))})
+            ({:apply function arity}
+             {ctx1 (cerl/ann_c_apply annots
+                                     (cerl/ann_c_fname annots function arity)
+                                     arg-list)})
+
+            ({:apply-rest function arity}
+             {ctx1 (cerl/ann_c_apply annots
+                                     (cerl/ann_c_fname annots function arity)
+                                     (args-to-arity arg-list 1 arity []))})
+
+            (:not-a-reference
+             (case (comp-expr (traverse-path path0) ctx0 target)
+               ({ctx1 cerl-val}
+                (case (is-rest-var? cerl-val)
+                     ({:rest arity}
+                      {ctx1 (cerl/ann_c_apply annots
+                                              cerl-val
+                                              (args-to-arity arg-list 1 arity []))})
+                     ({:not-rest arity}
+                      {ctx1 (cerl/ann_c_apply annots
+                                              cerl-val
+                                              arg-list)})
+                     (:unknown
+                      (case (make-rest-runtime-translate-fun ctx1 cerl-val (erlang/length arg-list))
+                        ({ctx2 t-var}
+                         {ctx2 (cerl/ann_c_apply annots
+                                                 t-var
+                                                 arg-list)}))))))))))))))
+
+(defn make-remote-rest-fun (ctx0 module function arity rest-arity)
+  (let (arg-list (lists/map (fn (_)
+                                (cerl/ann_c_var [:compiler_generated]
+                                                (gensym)))
+                            (lists/seq 1 arity))
+        annots [:compiler_generated])
+
+    {(incr-fun-index-ctx ctx0)
+     (cerl/ann_c_fun annots arg-list
+                     (cerl/ann_c_call annots
+                                      (cerl/ann_c_atom annots module)
+                                      (cerl/ann_c_atom annots function)
+                                      (args-to-arity arg-list 1 rest-arity [])))}))
+
+(defn make-apply-rest-fun (ctx0 f-var arity rest-arity)
+  (let (arg-list (lists/map (fn (_)
+                                (cerl/ann_c_var [:compiler_generated]
+                                                (gensym)))
+                            (lists/seq 1 arity))
+        annots [:compiler_generated])
+
+    {(incr-fun-index-ctx ctx0)
+     (cerl/ann_c_fun annots arg-list
+                     (cerl/ann_c_apply annots
+                                     f-var
+                                     (args-to-arity arg-list 1 rest-arity [])))}))
 
 (defn make-fun (path0 ctx0 form)
   (let (annots (annots-from-context [] path0 ctx0))
     (case form
       ({:--fun f a} (when (erlang/is_integer a))
+       ;; fix this
        (case (resolve-reference-ctx f a ctx0)
-         ({:reference var _}
-          (case (erlang/and (cerl/is_c_fname var)
-                            (== (cerl/fname_arity var) a))
-            (:true
-             {ctx0 (cerl/set_ann var annots)})
-            (:false
-             (let (idx (idx-from-context [] path0 ctx0))
-               (erlang/throw {:invalid-reference {f a} idx})))))
+         ({:reference var}
+          {ctx0 (add-to-annots var annots)})
          ({:apply name a}
-          {ctx0 (cerl/ann_c_fname annots name a)})
+          {ctx0 (cerl/ann_c_fname [{:not-rest a} annots] name a)})
+         ({:apply-rest name rest-arity}
+          (make-apply-rest-fun ctx0 (cerl/ann_c_fname [{:rest rest-arity} annots]  name a)
+                                     a rest-arity))
          (_
           (let (idx (idx-from-context [] path0 ctx0))
             (erlang/throw {:invalid-reference {f a} idx})))))
       ((= ref {:--fun _ _ a})
        (when (erlang/is_integer a))
        (case (resolve-reference-ctx ref a ctx0)
-         ({:reference _ _}
+         ({:reference _}
           (erlang/throw {:invalid-reference (idx-from-context [] path0 ctx0)}))
          ({:remote module function arity}
           (when (erlang/and (erlang/is_atom module)
@@ -1731,6 +1917,10 @@
                                  [(cerl/ann_c_atom annots module)
                                   (cerl/ann_c_atom annots function)
                                   (cerl/ann_c_int annots arity)])})
+         ({:remote-rest module function rest-arity}
+          (when (erlang/and (erlang/is_atom module)
+                            (erlang/is_atom function)))
+          (make-remote-rest-fun ctx0 module function a rest-arity))
          (_
           (erlang/throw {:undefined-reference ref (idx-from-context [] path0 ctx0)}))))
       (_
@@ -1752,15 +1942,27 @@
 (defn make-call (path0 ctx0 val args)
   (let (annots (annots-from-context [] path0 ctx0))
     (let (possible-arity (erlang/length args)
-          path1 (traverse-path path0)
-          call-annots (annots-from-context [] path1 ctx0))
+                         path1 (traverse-path path0)
+                         call-annots (annots-from-context [] path1 ctx0))
       (case (eval-args (incr-path path0) ctx0 args)
         ({ctx1 arg-list}
          (case (resolve-reference-ctx val possible-arity ctx1)
-           ({:reference var _}
-            {ctx1 (cerl/ann_c_apply annots
-                                    (cerl/set_ann var annots)
-                                    arg-list)})
+           ({:reference var}
+            (case (is-rest-var? var)
+              ({:rest arity}
+               {ctx1 (cerl/ann_c_apply annots
+                                       var
+                                       (args-to-arity arg-list 1 arity []))})
+              ({:not-rest arity}
+               {ctx1 (cerl/ann_c_apply annots
+                                       var
+                                       arg-list)})
+              (:unknown
+               (case (make-rest-runtime-translate-fun ctx1 var (erlang/length arg-list))
+                 ({ctx2 t-var}
+                  {ctx2 (cerl/ann_c_apply annots
+                                          t-var
+                                          arg-list)})))))
            ({:apply name arity}
             {ctx1 (cerl/ann_c_apply annots
                                     (cerl/ann_c_fname call-annots
@@ -1774,19 +1976,19 @@
                                                       arity)
                                     (args-to-arity arg-list 1 arity []))})
            ({:remote module function possible-arity}
-                 {ctx0 (cerl/ann_c_call annots
-                           (cerl/ann_c_atom call-annots
-                                            module)
-                           (cerl/ann_c_atom call-annots
-                                            function)
-                           arg-list)})
-            ({:remote-rest module function arity}
-                 {ctx0 (cerl/ann_c_call annots
-                           (cerl/ann_c_atom call-annots
-                                            module)
-                           (cerl/ann_c_atom call-annots
-                                            function)
-                            (args-to-arity arg-list 1 arity []))})
+            {ctx0 (cerl/ann_c_call annots
+                                   (cerl/ann_c_atom call-annots
+                                                    module)
+                                   (cerl/ann_c_atom call-annots
+                                                    function)
+                                   arg-list)})
+           ({:remote-rest module function arity}
+            {ctx0 (cerl/ann_c_call annots
+                                   (cerl/ann_c_atom call-annots
+                                                    module)
+                                   (cerl/ann_c_atom call-annots
+                                                    function)
+                                   (args-to-arity arg-list 1 arity []))})
            ({:error error}
             (erlang/throw {error (idx-from-context [] path0 ctx1)}))
            (:not-a-reference
@@ -1796,23 +1998,13 @@
                {ctx1 (cerl/ann_c_apply annots cerl-val arg-list)})))
            (:not-a-reference
             (case (resolve-reference-ctx val -1 ctx1)
-              ({:reference var _}
+              ({:reference var}
                {ctx1 (cerl/ann_c_apply annots
-                                       (cerl/set_ann var annots)
+                                       (add-to-annots var annots)
                                        arg-list)})
               (A
                (erlang/throw {:invalid-reference val possible-arity A
                                                  (idx-from-context [] path0 ctx1)}))))))))))
-
-(defn+ gensym ()
-  (let (x (erlang/phash2 {(erlang/node) (erlang/now ) (crypto/rand_bytes 16)})
-          bit-rep (lists/map (fn (el)
-                                 (io_lib/format "~.16B" [el]))
-                             (erlang/binary_to_list
-                              (binary/encode_unsigned x))))
-    (erlang/list_to_atom
-     (lists/flatten
-      (io_lib/format "GENSYM_~s" [bit-rep])))))
 
 (defn make-try (path0 ctx0 form)
   (let (annots (annots-from-context [] path0 ctx0))
@@ -1826,10 +2018,12 @@
                         type-var (cerl/ann_c_var annots type)
                         value-var (cerl/ann_c_var annots value)
                         ignore-var (cerl/ann_c_var (:compiler_generated . annots) (gensym))
-                        ctx2 (add-reference-to-scope-ctx type -1
-                                                         (add-reference-to-scope-ctx value -1
-                                                                                     (push-scope-ctx ctx1))))
-            (case (comp-expr (incr-path (traverse-incr-path 2 path0)) ctx2 catch-expr)
+                        ctx2 (add-reference-to-scope-ctx
+                              type type-var
+                              (add-reference-to-scope-ctx value value-var
+                                                          (push-scope-ctx ctx1))))
+            (case (comp-expr (incr-path (traverse-incr-path 2 path0))
+                             ctx2 catch-expr)
               ({ctx2 cerl-catch}
                {(pop-scope-ctx ctx2)
                 (cerl/ann_c_try annots cerl-expr [try-var] try-var
@@ -2001,44 +2195,62 @@
          ({_ ctx1 acc}
           {ctx1 (cerl/ann_c_binary annots (lists/reverse acc))}))))))
 
-(defn get-expr-arity (expr)
-  (case (cerl/type expr)
-    (:var
-     (case (cerl/fname_arity expr)
-       (:undefined
-        -1)
-       (arity (when (erlang/is_integer arity))
-              arity)))
-    (:fun
-     (cerl/fun_arity expr))
-    (_ -1)))
+(defn arg-arity (args count)
+  (case args
+    ([]
+     {[{:not-rest count}] count})
+    ((:&rest . _)
+     {[{:rest (+ count 1)}]  (+ count 1)})
+    ((_ . rest)
+     (arg-arity rest (+ count 1)))))
+
+;; This function exists to propogate information about rest args from
+;; the thing referenced to the thing referencing. This allows us to
+;; carry this information as deeply as possible through the tree.
+(defn propogate-annots (cerl-expr)
+  (let (annots (cerl/get_ann cerl-expr))
+    (case (lists/keysearch :rest 1 annots)
+      ({:value rest-pair}
+       [rest-pair])
+      (_
+       (case (lists/keysearch :not-rest 1 annots)
+         ({:value not-rest-pair}
+          [not-rest-pair])
+         (_
+          []))))))
 
 (defn make-let-binding (body-path0 binding-path0 ctx0 var expr continuation)
   (let (binding-path1 (traverse-path binding-path0)
-                      annots (annots-from-context [] binding-path1 ctx0))
+        annots (annots-from-context [] binding-path1 ctx0))
     (case expr
       ((:fn . (args . _))
        ;; For letrecs the variable has to be available in the scope so
        ;; the function can call as needed
-       (let (arity (erlang/length args)
-                   ctx1 (add-reference-to-scope-ctx var arity
-                                                    (push-scope-ctx ctx0))
-                   cerl-var (cerl/ann_c_fname annots var arity))
-         (case (comp-expr (traverse-incr-path binding-path0) ctx1 expr)
-           ({ctx3 cerl-expr}
-            (case (continuation body-path0 (incr-path binding-path0) ctx3)
-              ({ctx4 cerl-body}
-               {(pop-scope-ctx ctx4) (cerl/ann_c_letrec annots
-                                                        [{cerl-var cerl-expr}]
-                                                        cerl-body)}))))))
+       (case (arg-arity args 0)
+         ({new-annots arity}
+          (let (fn-annots (lists/append annots new-annots)
+                          cerl-var (cerl/ann_c_fname fn-annots var arity)
+                          ctx1 (add-reference-to-scope-ctx
+                                fn-annots
+                                var
+                                cerl-var
+                                (push-scope-ctx ctx0)))
+            (case (comp-expr (traverse-incr-path binding-path0) ctx1 expr)
+              ({ctx3 cerl-expr}
+               (case (continuation body-path0 (incr-path binding-path0) ctx3)
+                 ({ctx4 cerl-body}
+                  {(pop-scope-ctx ctx4) (cerl/ann_c_letrec annots
+                                                           [{cerl-var cerl-expr}]
+                                                           cerl-body)}))))))))
       (_
        (case (comp-expr (traverse-incr-path binding-path0)
                         ctx0
                         expr)
          ({ctx1 cerl-expr}
           (let (ctx2 (add-reference-to-scope-ctx
+                      (propogate-annots cerl-expr)
                       var
-                      (get-expr-arity cerl-expr)
+                      (cerl/c_var var)
                       (push-scope-ctx ctx1)))
             (case (continuation  body-path0 (incr-path binding-path0) ctx2)
               ({ctx4 cerl-body}
@@ -2109,14 +2321,14 @@
     ({:erlang :and 2} :true)
     ({:erlang :or 2} :true)
     ({:erlang :> 2} :true)
-  ({:erlang :< 2} :true)
-   ({:erlang :== 2} :true)
-   ({:erlang :=< 2} :true)
+    ({:erlang :< 2} :true)
+    ({:erlang :== 2} :true)
+    ({:erlang :=< 2} :true)
     ({:erlang :>= 2} :true)
-   ({:erlang :/= 2} :true)
-   ({:erlang :=:= 2} :true)
-   ({:erlang :=/= 2} :true)
-   (_ :false)))
+    ({:erlang :/= 2} :true)
+    ({:erlang :=:= 2} :true)
+    ({:erlang :=/= 2} :true)
+    (_ :false)))
 
 (defn check-guards (ast)
   (case (cerl/type ast)
@@ -2158,7 +2370,7 @@
   (let (annots (:compiler_generated .
                                     (annots-from-context [] path0 ctx0)))
     (case (resolve-reference-ctx var0 -1 ctx0)
-      ({:reference var1 _}
+      ({:reference var1}
        ;; The reference already exists. So we create a new variable and
        ;; add a guard for to test for equality
        (let (gensym (gensym)
@@ -2168,7 +2380,7 @@
                                                                :erlang)
                                               (cerl/ann_c_atom annots
                                                                :=:=)
-                                              [cerl-var (cerl/set_ann var1 annots)])
+                                              [cerl-var (add-to-annots var1 annots)])
                              . guards0))
          ;; We don't add the generated variable to the scope as we
          ;; don't want it to be available to the user (The user really
@@ -2179,7 +2391,7 @@
                          ;; The variable is not in the scope so we turn it to a
                          ;; variable
                          cerl-var (cerl/ann_c_var annots-bare var0)
-                         ctx1 (add-reference-to-scope-ctx var0 -1 ctx0))
+                         ctx1 (add-reference-to-scope-ctx var0 cerl-var ctx0))
          {ctx1 guards0 cerl-var})))))
 
 (defspec make-pattern-element ((path) (context) [(erlang/term)] (erlang/term))
@@ -2194,7 +2406,7 @@
       ({ctx1 guards1 cerl-pattern}
        (case (resolve-reference-ctx alias -1 ctx0)
          (:not-a-reference
-          {(add-reference-to-scope-ctx alias -1 ctx1)
+          {(add-reference-to-scope-ctx alias alias-var ctx1)
            guards1
            (cerl/ann_c_alias alias-annots alias-var cerl-pattern)})
          (_
@@ -2295,7 +2507,7 @@
        (let (gensym (erlang/list_to_atom (lists/append "_"
                                                        (erlang/atom_to_list (gensym))))
                     cerl-var (cerl/ann_c_var annots gensym)
-                    ctx1 (add-reference-to-scope-ctx gensym -1 ctx0))
+                    ctx1 (add-reference-to-scope-ctx gensym cerl-var ctx0))
          {ctx1 guards0 cerl-var}))
       (arg0 (when (erlang/is_atom arg0))
             (make-pattern-var path0 ctx0 guards0 arg0))
@@ -2444,7 +2656,8 @@
                                       el)))
                            (case acc0
                              ({ctx1 acc1}
-                              {(add-reference-to-scope-ctx arg -1 ctx1)
+                              {(add-reference-to-scope-ctx
+                                arg (cerl/c_var arg) ctx1)
                                (arg . acc1)}))))
                      {(push-scope-ctx ctx0)  []} args0)
     ({ctx2 args1}
@@ -2465,8 +2678,8 @@
            {ctx0 (cerl/ann_c_float annots arg)})
       (arg (when (erlang/is_atom arg))
            (case (resolve-reference-ctx arg -1 ctx0)
-             ({:reference var _}
-              {ctx0 (cerl/set_ann var annots)})
+             ({:reference var}
+              {ctx0 (add-to-annots var annots)})
              (e
               (let (idx (idx-from-context [] path0 ctx0))
                 (erlang/throw {:invalid-reference e arg idx})))))
@@ -2940,7 +3153,7 @@
 ;;
 (defn make-joxa-info-rest-1 (ctx0)
   (let (annots [:compiler_generated]
-        rests (get-context :rests ctx0))
+               rests (get-context :rests ctx0))
     (cerl/ann_c_clause [:compiler_generated]
                        [(cerl/ann_c_atom annots :rest)]
                        (cerl/ann_c_atom annots :true)
@@ -2949,9 +3162,9 @@
 
 (defn make-joxa-info-1 (ctx0)
   (let (annots [:compiler_generated]
-        clauses [(make-joxa-info-rest-1 ctx0)]
-        detail-var (gensym)
-        var-name (cerl/c_var detail-var))
+               clauses [(make-joxa-info-rest-1 ctx0)]
+               detail-var (gensym)
+               var-name (cerl/c_var detail-var))
     (add-exported-def-ctx annots :--joxa-info
                           [var-name]
                           (cerl/ann_c_case annots
@@ -2984,8 +3197,8 @@
 ;;
 (defn make-joxa-info-rest-2 (fun-var ctx0)
   (let (annots [:compiler_generated]
-        rests (get-context :rests ctx0)
-        catch-all-var (cerl/ann_c_var [:compiler_generated] (gensym)))
+               rests (get-context :rests ctx0)
+               catch-all-var (cerl/ann_c_var [:compiler_generated] (gensym)))
     (cerl/ann_c_case annots
                      fun-var
                      (lists/append
@@ -3000,20 +3213,20 @@
                                                                                {:atomic value} [])))))
                                  rests)
                       [(cerl/ann_c_clause annots
-                                         [catch-all-var]
-                                         (cerl/ann_c_atom annots :true)
-                                         (cerl/ann_c_atom annots :false))]))))
+                                          [catch-all-var]
+                                          (cerl/ann_c_atom annots :true)
+                                          (cerl/ann_c_atom annots :false))]))))
 
 (defn make-joxa-info-2 (ctx0)
   (let (annots [:compiler_generated]
-        type-var (cerl/c_var (gensym))
-        fun-id-var (cerl/c_var (gensym))
-        rest-clause (cerl/ann_c_clause annots
-                                       [(cerl/ann_c_atom annots :rest)]
-                                       (cerl/ann_c_atom annots :true)
-                                       (make-joxa-info-rest-2 fun-id-var ctx0))
+               type-var (cerl/c_var (gensym))
+               fun-id-var (cerl/c_var (gensym))
+               rest-clause (cerl/ann_c_clause annots
+                                              [(cerl/ann_c_atom annots :rest)]
+                                              (cerl/ann_c_atom annots :true)
+                                              (make-joxa-info-rest-2 fun-id-var ctx0))
 
-        clauses [rest-clause])
+               clauses [rest-clause])
     (add-exported-def-ctx [:compiler_generated] :--joxa-info
                           [type-var fun-id-var]
                           (cerl/ann_c_case [:compiler_generated]
@@ -3053,7 +3266,7 @@
 
 (defn+ compile-context (ctx0 compile-type)
   (let (ctx1 (make-joxa-info (comp-module-info ctx0))
-        annots (get-context :line ctx1)
+             annots (get-context :line ctx1)
              module-name (cerl/ann_c_atom annots
                                           (get-context :module-name ctx1))
              exports (get-context-exports ctx1)

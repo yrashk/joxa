@@ -35,19 +35,13 @@ test1_test() ->
     Ctx5 = joxa.compiler:'add-def-ctx'([], foo, [one, two], none, Ctx4),
     Ctx6 = joxa.compiler:'add-require-ctx'(lists,
                                            joxa.compiler:'add-alias-ctx'(bar, lists, Ctx5)),
-    Ctx7 = joxa.compiler:'add-reference-to-scope-ctx'(foo, -1, Ctx6),
+    Ctx7 = joxa.compiler:'add-reference-to-scope-ctx'(foo, cerl:c_var(foo), Ctx6),
 
-    ?assertMatch({reference, {c_var, [], foo}, -1},
+    ?assertMatch({reference, {c_var, [], foo}},
                  joxa.compiler:'resolve-reference-ctx'(foo, -1, Ctx7)),
 
     ?assertMatch({apply, foo, 2},
                  joxa.compiler:'resolve-reference-ctx'(foo, 2, Ctx7)),
-
-    ?assertMatch('not-a-reference',
-                 joxa.compiler:'resolve-reference-ctx'(foo, 3, Ctx7)),
-
-    ?assertMatch('not-a-reference',
-                 joxa.compiler:'resolve-reference-ctx'(foo, 1, Ctx7)),
 
     ?assertMatch({apply, foo, 0},
                  joxa.compiler:'resolve-reference-ctx'(foo, 0, Ctx7)),
