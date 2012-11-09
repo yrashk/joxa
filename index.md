@@ -53,7 +53,7 @@ unique language.
             (fibo (- n 2))))))
 
 
-**NOTE**: At the moment Joxa is a an beta product. It is used in
+**NOTE**: At the moment Joxa is a beta product. It is used in
 production, and fully self hosting. However, you should expect to find
 bugs and hopefully report and/or fix those bugs. There are also still
 a number of things that need to be done as far as libraries and the
